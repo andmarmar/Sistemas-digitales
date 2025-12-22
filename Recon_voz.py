@@ -4,33 +4,68 @@ import time
 import csv
 import math
 from datetime import datetime
+import audioop
 from vosk import Model, KaldiRecognizer, SpkModel # Importamos SpkModel
 import pyaudio
+import os
+
+import threading
+from deep_translator import GoogleTranslator
+from gtts import gTTS
+
+# --- CONFIGURACION NUEVA ---
+# Aqui ponemos el ID 1 que te dio el script de busqueda
+INDICE_MICROFONO = 1
+INPUT_RATE = 44100   # Tasa que le gusta al USB (44.1kHz)
+VOSK_RATE = 16000    # Tasa que necesita Vosk (16kHz)
 
 print("Cargando modelos (Voz y Hablantes)...")
 
-# --- CARGA DE MODELOS ---
-# Asegúrate de tener la carpeta 'model-es' y 'model-spk'
-model = Model("model-es") 
-spk_model = SpkModel("model-spk") # <--- NUEVO: Modelo de identidad de voz
+try:
+    model = Model("model-es") 
+    spk_model = SpkModel("model-spk")
+except Exception as e:
+    print(f"Error cargando modelos: {e}")
+    sys.exit()
 
-# Añadimos el spk_model al reconocedor
-rec = KaldiRecognizer(model, 16000, spk_model)
+rec = KaldiRecognizer(model, VOSK_RATE, spk_model)
 
 p = pyaudio.PyAudio()
-stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000,
-                input=True, frames_per_buffer=4096)
+
+print(f"Abriendo microfono ID {INDICE_MICROFONO} a {INPUT_RATE}Hz...")
+
+try:
+    stream = p.open(format=pyaudio.paInt16, 
+                    channels=1, 
+                    rate=INPUT_RATE, 
+                    input=True, 
+                    input_device_index=INDICE_MICROFONO,
+                    frames_per_buffer=4096)
+except Exception as e:
+    print(f"\n[ERROR] Fallo al abrir a {INPUT_RATE}Hz. Intentando con 48000Hz...")
+    try:
+        # Si 44100 falla, probamos 48000 (el otro estandar)
+        INPUT_RATE = 48000
+        stream = p.open(format=pyaudio.paInt16, 
+                        channels=1, 
+                        rate=INPUT_RATE, 
+                        input=True, 
+                        input_device_index=INDICE_MICROFONO,
+                        frames_per_buffer=4096)
+    except Exception as e2:
+        print(f"\n[ERROR FATAL] El microfono no acepta ni 44.1k ni 48k.")
+        print(f"Error: {e2}")
+        sys.exit()
+
 stream.start_stream()
+
 
 subtitulo_actual = ""
 momento_ultima_palabra = time.time()
 
-# --- GESTIÓN DE HABLANTES ---
-known_speakers = [] # Lista para guardar los vectores de voz de los hablantes encontrados
-speaker_names = []  # Lista para guardar los nombres (Hablante 1, Hablante 2...)
+known_speakers = [] 
+speaker_names = []
 
-# Función matemática simple para comparar voces (Distancia Coseno)
-# Devuelve un valor entre 0 (misma persona) y 1 (persona muy distinta)
 def get_distance(vec1, vec2):
     dot_product = sum(a*b for a, b in zip(vec1, vec2))
     norm_a = math.sqrt(sum(a*a for a in vec1))
@@ -38,11 +73,10 @@ def get_distance(vec1, vec2):
     return 1 - (dot_product / (norm_a * norm_b))
 
 def identificar_hablante(vector_voz):
-    umbral = 0.85  # Ajusta esto si confunde personas (0.3 estricto - 0.6 relajado)
+    umbral = 0.85 
     best_dist = 100
     speaker_idx = -1
 
-    # Comparamos la voz actual con las que ya conocemos
     for i, known_vec in enumerate(known_speakers):
         dist = get_distance(vector_voz, known_vec)
         if dist < best_dist:
@@ -52,26 +86,22 @@ def identificar_hablante(vector_voz):
     if speaker_idx != -1:
         print(f"   (Diferencia con {speaker_names[speaker_idx]}: {best_dist:.4f})")
     
-    # Si la distancia es menor al umbral, es alguien conocido
     if best_dist < umbral and speaker_idx != -1:
         return speaker_names[speaker_idx]
     else:
-        # Es alguien nuevo
         new_name = f"Hablante {len(known_speakers) + 1}"
         known_speakers.append(vector_voz)
         speaker_names.append(new_name)
         return new_name
 
-# --- CONTADOR DE PALABRAS ---
 frecuencia_palabras = {}
 tiempo_inicio = time.time()
 
-print("Habla cuando quieras (Detectando hablantes...):\n")
 
 def actualizar_frecuencias(texto):
     palabras = texto.lower().split()
     for p in palabras:
-        p = p.strip(".,;:¿?¡!()\"'")
+        p = p.strip(".,;:Â¿?Â¡!()\"'")
         if p:
             frecuencia_palabras[p] = frecuencia_palabras.get(p, 0) + 1
 
@@ -84,50 +114,75 @@ def generar_csv():
         writer.writerow(["palabra", "frecuencia"])
         for palabra, freq in sorted(frecuencia_palabras.items(), key=lambda x: -x[1]):
             writer.writerow([palabra, freq])
-    
+
     print(f"\n[CSV generado] {nombre_archivo}\n")
 
-while True:
-    data = stream.read(4000, exception_on_overflow=False)
-
-    # --- Comprobamos si terminó una frase ---
-    if rec.AcceptWaveform(data):
-        resultado = json.loads(rec.Result())
-        texto = resultado.get("text", "").strip()
+def narrar_traduccion(texto_original, hablante):
+    try:
+        traductor = GoogleTranslator(source='es', target='en')
+        texto_ingles = traductor.translate(texto_original)
         
-        # Obtenemos el vector de voz (spk) si existe
-        spk_vector = resultado.get("spk")
+        print(f"   >>> [Traduccion]: {texto_ingles}")
+        
+        tts = gTTS(text=texto_ingles, lang='en', slow=False)
+        
+        nombre_mp3 = f"temp_{int(time.time()*1000)}.mp3"
+        tts.save(nombre_mp3)
+        
+        os.system(f"mpg123 -q {nombre_mp3}")
+        
+        os.remove(nombre_mp3)
 
-        if texto:
-            nombre_hablante = "Desconocido"
+    except Exception as e:
+        print(f"[Error Traductor]: {e}")
+        
+print("Habla cuando quieras (Detectando hablantes...):\n")
+
+        
+while True:
+    try:
+        # 1. Leer datos raw del microfono
+        data = stream.read(4096, exception_on_overflow=False)
+        
+        # 2. CONVERSION IMPORTANTE: De 44100Hz a 16000Hz
+        # Sin esta linea, Vosk no entendera nada
+        data, _ = audioop.ratecv(data, 2, 1, INPUT_RATE, VOSK_RATE, None)
+
+        if rec.AcceptWaveform(data):
+            resultado = json.loads(rec.Result())
+            texto = resultado.get("text", "").strip()
+
+            spk_vector = resultado.get("spk")
+
+            if texto:
+                nombre_hablante = "Desconocido"
+
+                if spk_vector:
+                    nombre_hablante = identificar_hablante(spk_vector)
+
+                print(f"\n[{nombre_hablante}]: {texto}")
             
-            # Si Vosk detectó un vector de voz, identificamos quién es
-            if spk_vector:
-                nombre_hablante = identificar_hablante(spk_vector)
+                actualizar_frecuencias(texto)
+                t = threading.Thread(target=narrar_traduccion, args=(texto, nombre_hablante))
+                t.start()
+                subtitulo_actual = ""      
+                print("")
 
-            # Imprimimos con el formato: [Hablante X]: Texto
-            print(f"\n[{nombre_hablante}]: {texto}")
-            
-            actualizar_frecuencias(texto)
-            subtitulo_actual = ""      
-            print("")
-    else:
-        # --- Texto parcial en tiempo real ---
-        parcial = json.loads(rec.PartialResult())
-        texto = parcial.get("partial", "").strip()
+        else:
+            parcial = json.loads(rec.PartialResult())
+            texto = parcial.get("partial", "").strip()
 
-        if texto:
-            subtitulo_actual = texto
-            # Nota: No podemos identificar hablante en el parcial, solo al final
-            sys.stdout.write("\r" + "..." + subtitulo_actual + " " * 20)
-            sys.stdout.flush()
-            momento_ultima_palabra = time.time()
+            if texto:
+                subtitulo_actual = texto
+                sys.stdout.write("\r" + "..." + subtitulo_actual + " " * 20)
+                sys.stdout.flush()
+                momento_ultima_palabra = time.time()
 
-    # --- Generar CSV cada 60 segundos ---
-    if time.time() - tiempo_inicio >= 60:
-        generar_csv()
-        frecuencia_palabras.clear()
-        tiempo_inicio = time.time()
+        if time.time() - tiempo_inicio >= 60:
+            generar_csv()
+            frecuencia_palabras.clear()
+            tiempo_inicio = time.time()
 
-
-
+    except KeyboardInterrupt:
+            print("\nSaliendo...")
+            break
