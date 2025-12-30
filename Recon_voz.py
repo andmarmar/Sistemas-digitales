@@ -8,18 +8,58 @@ import audioop
 from vosk import Model, KaldiRecognizer, SpkModel # Importamos SpkModel
 import pyaudio
 import os
+import numpy as np
+
 
 import threading
 from deep_translator import GoogleTranslator
 from gtts import gTTS
 
+from sense_hat import SenseHat
+
+import cv2
+from picamera2 import Picamera2
+from PIL import ImageFont, ImageDraw, Image
+
 # --- CONFIGURACION NUEVA ---
-# Aqui ponemos el ID 1 que te dio el script de busqueda
-INDICE_MICROFONO = 1
+INDICE_MICROFONO = 1	#Importante abir el alsamixer para activar el micro y subir volumen de los cascos
 INPUT_RATE = 44100   # Tasa que le gusta al USB (44.1kHz)
 VOSK_RATE = 16000    # Tasa que necesita Vosk (16kHz)
 
+sense = SenseHat()
+sense.clear()
+sense.low_light = True
+
+OFF = [0, 0, 0]
+VERDE = [0, 255, 0]
+AMARILLO = [255, 255, 0]
+ROJO = [255, 0, 0]
+
+SENSIBILIDAD = 1500
+
+
+PALETA_COLORES = [
+    (0, 255, 255),
+    (255, 0, 255),  # Magenta (Hablante 2)
+    (255, 165, 0),  # Naranja (Hablante 3)
+    (0, 255, 0),    # Verde Lima (Hablante 4)
+    (100, 149, 237) # Azul (Hablante 5)
+]
+COLOR_NEUTRO = (255, 255, 255)
+
+TEXTO_PARA_MOSTRAR = "Esperando voz..." 
+NOMBRE_HABLANTE_ACTUAL = ""
+
 print("Cargando modelos (Voz y Hablantes)...")
+
+picam2 = Picamera2()
+config = picam2.create_video_configuration(
+    main={"size": (640, 480), "format": "RGB888"}
+)
+picam2.configure(config)
+picam2.start()
+
+cv2.namedWindow("Subtitulos en Vivo", cv2.WINDOW_NORMAL)
 
 try:
     model = Model("model-es") 
@@ -60,11 +100,43 @@ except Exception as e:
 stream.start_stream()
 
 
-subtitulo_actual = ""
+subtitulo_actual = "Escuchando..."
+texto_final_confirmado = ""
 momento_ultima_palabra = time.time()
 
 known_speakers = [] 
 speaker_names = []
+
+def dibujar_onda(fragmento_audio):
+    """Calcula el volumen y dibuja barras en el Sense HAT"""
+    try:
+        # Calcular RMS (Root Mean Square) -> Volumen promedio del fragmento
+        rms = audioop.rms(fragmento_audio, 2)
+        
+        # Convertir el volumen (0 a SENSIBILIDAD) a un numero de filas (0 a 8)
+        nivel = min(8, int((rms / SENSIBILIDAD) * 8))
+        
+        # Crear la matriz de pixeles (64 pixeles)
+        pixels = [OFF] * 64
+        
+        for fila in range(8):
+            # Invertimos la fila para que el 0 sea abajo (SenseHAT tiene 0,0 arriba)
+            fila_real = 7 - fila
+            
+            if fila < nivel:
+                # Elegir color segun intensidad
+                color = VERDE
+                if fila >= 4: color = AMARILLO
+                if fila >= 6: color = ROJO
+                
+                # Encender toda la fila_real
+                for col in range(8):
+                    pixels[fila_real * 8 + col] = color
+        
+        sense.set_pixels(pixels)
+        
+    except Exception:
+        pass
 
 def get_distance(vec1, vec2):
     dot_product = sum(a*b for a, b in zip(vec1, vec2))
@@ -136,13 +208,74 @@ def narrar_traduccion(texto_original, hablante):
     except Exception as e:
         print(f"[Error Traductor]: {e}")
         
+
+def poner_texto_con_tildes(imagen_cv2, texto, color_texto):
+	img_pil = Image.fromarray(cv2.cvtColor(imagen_cv2, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    ancho_img, alto_img = img_pil.size
+    try:
+        font_size = 30
+        # Ruta estandar en Raspberry Pi
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+    except IOError:
+        # Si no la encuentra, carga la por defecto (aunque esa puede ser fea)
+        font = ImageFont.load_default()
+        
+        
+    margen_lateral = 20
+    ancho_maximo = ancho_img - (margen_lateral * 2)
+    
+    palabras = texto.split()
+    lineas = []
+    linea_actual = ""
+    
+    for palabra in palabras:
+		prueba = linea_actual + " " + palabra if linea_actual else palabra
+		try:
+            ancho_prueba = font.getlength(prueba)
+        except AttributeError:
+            ancho_prueba = font.getsize(prueba)[0]
+        
+        if ancho_prueba <= ancho_maximo:
+            linea_actual = prueba
+        else:
+			lineas.append(linea_actual)
+            linea_actual = palabra
+            
+    if linea_actual:
+        lineas.append(linea_actual)
+        
+    alto_linea = font_size + 5
+    y_inicio = alto_img - 30 - (len(lineas) * alto_linea)
+    
+    for i, linea in enumerate(lineas):
+        try:
+            ancho_linea = font.getlength(linea)
+        except:
+            ancho_linea = font.getsize(linea)[0]
+            
+        x = (ancho_img - ancho_linea) // 2 
+        y = y_inicio + (i * alto_linea)
+        
+        rango = 2
+        for dx in range(-rango, rango + 1):
+            for dy in range(-rango, rango + 1):
+                draw.text((x + dx, y + dy), linea, font=font, fill=(0, 0, 0))
+                
+        draw.text((x, y), linea, font=font, fill=color_texto)
+             
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
 print("Habla cuando quieras (Detectando hablantes...):\n")
 
-        
+color_actual_pantalla = COLOR_NEUTRO
+
 while True:
     try:
         # 1. Leer datos raw del microfono
         data = stream.read(4096, exception_on_overflow=False)
+        
+        dibujar_onda(data)
         
         # 2. CONVERSION IMPORTANTE: De 44100Hz a 16000Hz
         # Sin esta linea, Vosk no entendera nada
@@ -156,11 +289,21 @@ while True:
 
             if texto:
                 nombre_hablante = "Desconocido"
+                indice_color = -1
 
                 if spk_vector:
                     nombre_hablante = identificar_hablante(spk_vector)
+                    if nombre_hablante in speaker_names:
+                        idx = speaker_names.index(nombre_hablante)
+                        # Usamos modulo (%) para rotar colores si hay muchos hablantes
+                        color_actual_pantalla = PALETA_COLORES[idx % len(PALETA_COLORES)]
+                    else:
+                        color_actual_pantalla = COLOR_NEUTRO
 
                 print(f"\n[{nombre_hablante}]: {texto}")
+                
+                texto_final_confirmado = f"{nombre_hablante}: {texto}"
+                subtitulo_actual = ""
             
                 actualizar_frecuencias(texto)
                 t = threading.Thread(target=narrar_traduccion, args=(texto, nombre_hablante))
@@ -174,9 +317,32 @@ while True:
 
             if texto:
                 subtitulo_actual = texto
+                color_actual_pantalla = COLOR_NEUTRO
                 sys.stdout.write("\r" + "..." + subtitulo_actual + " " * 20)
                 sys.stdout.flush()
                 momento_ultima_palabra = time.time()
+                
+        #Video
+        frame = picam2.capture_array()
+        
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        if subtitulo_actual:
+            texto_pantalla = subtitulo_actual
+            color_a_usar = COLOR_NEUTRO
+        else:
+            texto_pantalla = texto_final_confirmado
+            color_a_usar = color_actual_pantalla
+            
+           
+            
+        alto, ancho, _ = frame.shape
+        frame = poner_texto_con_tildes(frame, texto_pantalla, color_a_usar)        
+        cv2.imshow("Subtitulos en Vivo", frame)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        
 
         if time.time() - tiempo_inicio >= 60:
             generar_csv()
@@ -184,5 +350,12 @@ while True:
             tiempo_inicio = time.time()
 
     except KeyboardInterrupt:
-            print("\nSaliendo...")
+            print("\nSaliendo y apagando luces...")
+            sense.clear() # Apagar luces al salir
             break
+            
+stream.stop_stream()
+stream.close()
+p.terminate()
+picam2.stop()
+cv2.destroyAllWindows()
